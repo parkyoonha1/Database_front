@@ -77,84 +77,6 @@ function isHashChainAction(action: string | undefined): boolean {
   return action === 'INITIAL_REGISTRATION' || action === 'TRANSFER'
 }
 
-function compareHash(a: string | undefined, b: string | undefined): boolean {
-  return (a ?? '').trim() === (b ?? '').trim()
-}
-
-function formatLogPoint(log: CustodyLogRow, index: number): string {
-  const label = actionLabel(log.action)
-  const time = formatEvidenceDate(log.actionTime)
-  return `${index + 1}번째 기록(${label}, ${time})`
-}
-
-function buildHashChainResult(logs: CustodyLogRow[]): string {
-  const chainLogs = logs.filter(
-    (log) => log.action === 'INITIAL_REGISTRATION' || log.action === 'TRANSFER',
-  )
-  if (chainLogs.length === 0) {
-    return '해시체인 확인 결과\n\n검사할 인수인계 이력이 없습니다.'
-  }
-
-  const orderedLogs = chainLogs
-    .map((log, index) => ({ log, index }))
-    .sort((a, b) => {
-      const aTime = Date.parse(a.log.actionTime ?? '')
-      const bTime = Date.parse(b.log.actionTime ?? '')
-      if (Number.isNaN(aTime) || Number.isNaN(bTime)) return a.index - b.index
-      return aTime - bTime
-    })
-    .map((item) => item.log)
-
-  const issues: string[] = []
-  const first = orderedLogs[0]
-  if (first.action !== 'INITIAL_REGISTRATION') {
-    issues.push('최초 등록 기록이 없어 체인의 시작점을 확인할 수 없습니다.')
-  }
-
-  orderedLogs.forEach((log, index) => {
-    if (!log.currentHash?.trim()) {
-      issues.push(`${formatLogPoint(log, index)}의 현재 해시가 비어 있습니다.`)
-    }
-  })
-
-  for (let i = 1; i < orderedLogs.length; i += 1) {
-    const previous = orderedLogs[i - 1]
-    const current = orderedLogs[i]
-    if (!current.previousHash?.trim()) {
-      issues.push(`${formatLogPoint(current, i)}의 이전 해시가 비어 있습니다.`)
-      continue
-    }
-    if (!compareHash(previous.currentHash, current.previousHash)) {
-      issues.push(
-        [
-          `${formatLogPoint(current, i)}에서 해시 연결이 끊겼습니다.`,
-          `예상 이전 해시: ${previous.currentHash || '없음'}`,
-          `기록된 이전 해시: ${current.previousHash || '없음'}`,
-        ].join('\n'),
-      )
-    }
-  }
-
-  if (issues.length === 0) {
-    return [
-      '해시체인 확인 결과',
-      '',
-      `총 ${orderedLogs.length}개 기록을 검사했습니다.`,
-      '이전 해시와 직전 현재 해시가 모두 일치합니다.',
-      '강제로 수정된 흔적이 발견되지 않았습니다.',
-    ].join('\n')
-  }
-
-  return [
-    '해시체인 확인 결과',
-    '',
-    `총 ${orderedLogs.length}개 기록 중 ${issues.length}개 이상 항목에서 이상이 발견되었습니다.`,
-    '강제로 수정되었거나 이력 데이터가 누락되었을 가능성이 있습니다.',
-    '',
-    ...issues,
-  ].join('\n')
-}
-
 export default function EvidenceDetailPage() {
   const { evidenceId } = useParams<{ evidenceId: string }>()
   const [row, setRow] = useState<EvidenceSummary | null>(null)
@@ -222,38 +144,35 @@ export default function EvidenceDetailPage() {
 
     setCheckingHashChain(true)
     try {
-      // 1. 실제 파일의 물리적 무결성 검증 (서버에서 파일 해싱 수행)
+      // 1. 백엔드 통합 무결성 검증 (실물 파일 + 장부 재계산 검증)
       const verifyRes = await apiFetch(`/evidence/${evidenceId}/verify`, { method: 'POST' })
-      let fileStatus = '확인 불가'
-      let fileIntact = false
+      if (!verifyRes.ok) throw new Error(await readApiErrorMessage(verifyRes))
       
-      if (verifyRes.ok) {
-        const verifyData = asRecord(await verifyRes.json())
-        fileIntact = !!verifyData?.verified
-        fileStatus = fileIntact ? '정상 (변조 없음)' : '⚠️ 변조 또는 유실 감지!'
-      }
+      const verifyData = asRecord(await verifyRes.json())
+      const isTotallyIntact = !!verifyData?.verified
+      const verificationMessage = toText(verifyData?.message)
 
-      // 2. DB 로그의 논리적 해시체인 검증
-      const res = await apiFetch(`/evidence/${evidenceId}/history`)
-      if (!res.ok) throw new Error(await readApiErrorMessage(res))
-      const latestLogs = parseCustodyLogs((await res.json()) as unknown)
-      setLogs(latestLogs)
+      // 2. 히스토리 목록 갱신 (화면 표시용)
+      const historyRes = await apiFetch(`/evidence/${evidenceId}/history`)
+      if (historyRes.ok) {
+        const latestLogs = parseCustodyLogs((await historyRes.json()) as unknown)
+        setLogs(latestLogs)
+      }
       
-      const chainReport = buildHashChainResult(latestLogs)
-      
-      // 3. 종합 결과 알림
+      // 3. 통합 결과 리포트 (백엔드 결과를 100% 신뢰)
       const finalReport = [
-        '🔍 무결성 정밀 검증 결과',
+        '무결성 정밀 검증 결과',
         '--------------------------------',
-        `[1] 실물 파일 상태: ${fileStatus}`,
-        `[2] 장부(DB) 상태: ${chainReport.split('\n').slice(2).join('\n')}`, // 보고서 제목 제외하고 합침
+        `상태: ${verificationMessage}`,
         '--------------------------------',
-        fileIntact ? '✅ 최종 결론: 이 증거물은 안전합니다.' : '❌ 최종 결론: 보안 위협이 감지되었습니다!'
+        isTotallyIntact 
+          ? '최종 결론: 이 증거물은 안전합니다.' 
+          : '최종 결론: 보안 위협이 감지되었습니다!'
       ].join('\n')
       
       window.alert(finalReport)
     } catch (e) {
-      window.alert(e instanceof Error ? e.message : '해시체인 확인에 실패했습니다.')
+      window.alert(e instanceof Error ? e.message : '무결성 검증에 실패했습니다.')
     } finally {
       setCheckingHashChain(false)
     }
